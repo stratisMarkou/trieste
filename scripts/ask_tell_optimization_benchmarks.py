@@ -1,7 +1,13 @@
+import os
+import sys
+sys.path.append("./scripts")
+
 import argparse
 
 import gpflow
 import numpy as np
+
+import trieste
 from trieste.models.gpflow.models import GaussianProcessRegression
 from trieste.ask_tell_optimization import AskTellOptimizer
 from trieste.acquisition.optimizer import generate_continuous_optimizer
@@ -20,12 +26,14 @@ from trieste.acquisition.function import (
     GreedyContinuousThompsonSampling,
 )
 
-import trieste
 from trieste.objectives.utils import mk_observer
 from trieste.objectives.single_objectives import *
 
+from utils import make_gp_objective, arg_summary
 
-objectives = {
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+standard_objectives = {
     "scaled_branin": (
         scaled_branin,
         SCALED_BRANIN_MINIMUM,
@@ -47,6 +55,12 @@ objectives = {
         HARTMANN_6_SEARCH_SPACE,
     ),
 }
+
+gp_objectives = [
+    "eq",
+    "matern32",
+    "matern52",
+]
 
 
 def build_model(
@@ -87,9 +101,6 @@ def log10_regret(queries: tf.Tensor, minimum: tf.Tensor) -> tf.Tensor:
     return tf.math.log(regret) / tf.cast(tf.math.log(10.), dtype=regret.dtype)
 
 
-def arg_summmary(args):
-    return "\n".join([f"{k:<32} | {v:<64}" for k, v in args.__dict__.items()])
-
 
 def main():
 
@@ -98,7 +109,7 @@ def main():
     parser.add_argument(
         "objective",
         type=str,
-        choices=objectives.keys(),
+        choices=list(standard_objectives.keys()) + gp_objectives,
     )
 
     parser.add_argument(
@@ -109,6 +120,7 @@ def main():
             "thompson",
             "ei",
         ],
+        help="Which acquisition strategy to use",
     )
 
     parser.add_argument(
@@ -139,6 +151,18 @@ def main():
     )
 
     parser.add_argument(
+        "--objective_dimension",
+        type=int,
+        default=4,
+    )
+
+    parser.add_argument(
+        "--objective_fourier_components",
+        type=int,
+        default=1024,
+    )
+
+    parser.add_argument(
         "--trainable_noise",
         action="store_true",
         default=False,
@@ -151,7 +175,7 @@ def main():
 
     args = parser.parse_args()
 
-    summary = arg_summmary(args)
+    summary = arg_summary(args)
     print(summary)
 
     # Set random seed
@@ -159,13 +183,28 @@ def main():
     np.random.seed(args.seed)
 
     # Set objective
-    objective, minimum, search_space = objectives[args.objective]
+    if args.objective in standard_objectives:
+        objective, minimum, search_space = standard_objectives[args.objective]
+
+    else:
+
+        search_space = trieste.space.Box(
+            lower=args.objective_dimension*[-1.],
+            upper=args.objective_dimension*[1.],
+        )
+
+        objective, minimum = make_gp_objective(
+            kernel=args.objective,
+            num_fourier_components=args.objective_fourier_components,
+            search_space=search_space,
+        )
 
     # Observe initial points
     D = int(search_space.dimension)
     num_initial_points = 2 * D + 2
     initial_query_points = search_space.sample(num_initial_points)
     observer = mk_observer(objective)
+    print(initial_query_points.shape)
     initial_dataset = observer(initial_query_points)
 
     model = build_gpr(
@@ -226,3 +265,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
