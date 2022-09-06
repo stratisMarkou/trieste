@@ -1,8 +1,8 @@
 import argparse
 
-import tensorflow as tf
-import tensorflow_probability as tfp
 import gpflow
+import numpy as np
+import scipy as scp
 from trieste.models.gpflow.models import GaussianProcessRegression
 from trieste.ask_tell_optimization import AskTellOptimizer
 
@@ -137,6 +137,7 @@ def main():
 
     # Set random seed
     tf.random.set_seed(args.seed)
+    np.random.seed(args.seed)
 
     # Set objective
     objective, minimum, search_space = objectives[args.objective]
@@ -201,4 +202,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
