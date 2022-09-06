@@ -2,9 +2,9 @@ import argparse
 
 import gpflow
 import numpy as np
-import scipy as scp
 from trieste.models.gpflow.models import GaussianProcessRegression
 from trieste.ask_tell_optimization import AskTellOptimizer
+from trieste.acquisition.optimizer import generate_continuous_optimizer
 
 from trieste.acquisition.rule import (
     RandomSampling,
@@ -87,6 +87,10 @@ def log10_regret(queries: tf.Tensor, minimum: tf.Tensor) -> tf.Tensor:
     return tf.math.log(regret) / tf.cast(tf.math.log(10.), dtype=regret.dtype)
 
 
+def arg_summmary(args):
+    return "\n".join([f"{k:<32} | {v:<64}" for k, v in args.__dict__.items()])
+
+
 def main():
 
     parser = argparse.ArgumentParser()
@@ -123,6 +127,18 @@ def main():
     )
 
     parser.add_argument(
+        "-num_initial_designs",
+        type=int,
+        default=10000,
+    )
+
+    parser.add_argument(
+        "-num_optimization_runs",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
         "--trainable_noise",
         action="store_true",
         default=False,
@@ -134,6 +150,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    summary = arg_summmary(args)
+    print(summary)
 
     # Set random seed
     tf.random.set_seed(args.seed)
@@ -171,9 +190,15 @@ def main():
                 sample_size=args.num_ei_samples,
             )
 
+        continuous_optimizer = generate_continuous_optimizer(
+            num_initial_samples=args.num_initial_designs,
+            num_optimization_runs=args.num_optimization_runs,
+        )
+
         rule = EfficientGlobalOptimization(
             num_query_points=args.batch_size,
             builder=acquisition_function,
+            optimizer=continuous_optimizer,
         )
 
     # Create ask-tell optimizer
@@ -188,16 +213,15 @@ def main():
     for i in range(args.num_batches):
 
         query_batch = optimizer.ask()
-        print(optimizer.model.model.kernel.lengthscales)
         query_values = observer(query_batch)
         optimizer.tell(query_values)
 
-        print(
-            log10_regret(
-                queries=optimizer.to_result().try_get_final_dataset().observations,
-                minimum=minimum,
-            )
+        log_regret = log10_regret(
+            queries=optimizer.to_result().try_get_final_dataset().observations,
+            minimum=minimum,
         )
+
+        print(f"Batch {i}: Log10 regret {log_regret:.3f}")
 
 
 if __name__ == "__main__":
