@@ -22,7 +22,9 @@ from trieste.models.gpflow.builders import (
 )
 
 from trieste.acquisition.function import (
+    ExpectedImprovement,
     BatchMonteCarloExpectedImprovement,
+    AnnealedBatchMonteCarloExpectedImprovement,
     GreedyContinuousThompsonSampling,
 )
 
@@ -31,7 +33,6 @@ from trieste.objectives.single_objectives import *
 
 from utils import make_gp_objective, arg_summary
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 standard_objectives = {
     "scaled_branin": (
@@ -101,16 +102,21 @@ def log10_regret(queries: tf.Tensor, minimum: tf.Tensor) -> tf.Tensor:
     return tf.math.log(regret) / tf.cast(tf.math.log(10.), dtype=regret.dtype)
 
 
+def save_results(iteration, path, optimizer, minimum):
+
+    observations = optimizer.to_result().try_get_final_dataset().observations
+    log_regret = log10_regret(queries=observations, minimum=minimum)
+
+    with open(f"{path}/log-regret.txt", "a") as file:
+        file.write(f"{iteration}, {observations.shape[0]}, {log_regret}\n")
+        file.close()
+
+    return log_regret
+
 
 def main():
 
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "objective",
-        type=str,
-        choices=list(standard_objectives.keys()) + gp_objectives,
-    )
 
     parser.add_argument(
         "acquisition",
@@ -119,12 +125,26 @@ def main():
             "random",
             "thompson",
             "ei",
+            "mcei",
+            "amcei",
         ],
         help="Which acquisition strategy to use",
     )
 
     parser.add_argument(
-        "-seed",
+        "objective",
+        type=str,
+        choices=list(standard_objectives.keys()) + gp_objectives,
+    )
+
+    parser.add_argument(
+        "-linear_stddev",
+        type=float,
+        default=1e-6,
+    )
+
+    parser.add_argument(
+        "-search_seed",
         type=int,
     )
 
@@ -139,21 +159,39 @@ def main():
     )
 
     parser.add_argument(
-        "-num_initial_designs",
+        "--objective_seed",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--num_initial_designs",
         type=int,
         default=10000,
     )
 
     parser.add_argument(
-        "-num_optimization_runs",
+        "--num_ei_acquisitions",
         type=int,
-        default=5,
+        default=100,
+    )
+
+    parser.add_argument(
+        "--num_optimization_runs",
+        type=int,
+        default=10,
     )
 
     parser.add_argument(
         "--objective_dimension",
         type=int,
-        default=4,
+        default=-1,
+    )
+
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=5.,
     )
 
     parser.add_argument(
@@ -169,8 +207,15 @@ def main():
     )
 
     parser.add_argument(
-        "--num_ei_samples",
+        "--num_mcei_samples",
         type=int,
+        default=1000,
+    )
+
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="experiments",
     )
 
     args = parser.parse_args()
@@ -178,9 +223,37 @@ def main():
     summary = arg_summary(args)
     print(summary)
 
-    # Set random seed
-    tf.random.set_seed(args.seed)
-    np.random.seed(args.seed)
+    assert not (args.objective in gp_objectives and args.objective_dimension == -1)
+
+    # Make directory to save results
+    params = f"seed-{args.search_seed}"
+
+    if not (args.acquisition == "ei"):
+        params = params + f"_batch_size-{args.batch_size}"
+
+    if "mcei" in args.acquisition:
+        params = params + f"_num_mcei_samples-{args.num_mcei_samples}"
+
+    if args.objective in gp_objectives:
+        objective_name = f"{args.objective}_{args.objective_dimension}_{args.objective_seed}"
+
+    else:
+        objective_name = args.objective
+
+    path = os.path.join(
+        args.save_dir,
+        args.acquisition,
+        objective_name,
+        params,
+    )
+
+    os.makedirs(path, exist_ok=True)
+    with open(f"{path}/arguments.txt", "w") as file:
+        file.write(summary)
+        file.close()
+
+    if os.path.exists(f"{path}/log-regret.txt"):
+        os.remove(f"{path}/log-regret.txt")
 
     # Set objective
     if args.objective in standard_objectives:
@@ -193,18 +266,25 @@ def main():
             upper=args.objective_dimension*[1.],
         )
 
+        tf.random.set_seed(args.objective_seed)
+        np.random.seed(args.objective_seed)
+
         objective, minimum = make_gp_objective(
             kernel=args.objective,
             num_fourier_components=args.objective_fourier_components,
             search_space=search_space,
+            linear_stddev=args.linear_stddev,
         )
+
+    # Set search seed
+    tf.random.set_seed(args.search_seed)
+    np.random.seed(args.search_seed)
 
     # Observe initial points
     D = int(search_space.dimension)
     num_initial_points = 2 * D + 2
     initial_query_points = search_space.sample(num_initial_points)
     observer = mk_observer(objective)
-    print(initial_query_points.shape)
     initial_dataset = observer(initial_query_points)
 
     model = build_gpr(
@@ -218,24 +298,45 @@ def main():
     # Create acquisition rule
     if args.acquisition == "random":
         rule = RandomSampling(num_query_points=args.batch_size)
+        num_bo_steps = args.num_batches
 
     else:
 
         if args.acquisition == "thompson":
             acquisition_function = GreedyContinuousThompsonSampling()
+            num_bo_steps = args.num_batches
+            batch_size = args.batch_size
 
         elif args.acquisition == "ei":
+            acquisition_function = ExpectedImprovement()
+            num_bo_steps = args.batch_size * args.num_batches
+            batch_size = 1
+
+        elif args.acquisition == "mcei":
             acquisition_function = BatchMonteCarloExpectedImprovement(
-                sample_size=args.num_ei_samples,
+                sample_size=args.num_mcei_samples,
             )
+            num_bo_steps = args.num_batches
+            batch_size = args.batch_size
+
+        elif args.acquisition == "amcei":
+            acquisition_function = AnnealedBatchMonteCarloExpectedImprovement(
+                beta=args.beta,
+                sample_size=args.num_mcei_samples,
+            )
+            num_bo_steps = args.num_batches
+            batch_size = args.batch_size
+
+        optimizer_args = {"options": {"gtol" : 1e-9}}
 
         continuous_optimizer = generate_continuous_optimizer(
             num_initial_samples=args.num_initial_designs,
             num_optimization_runs=args.num_optimization_runs,
+            optimizer_args=optimizer_args,
         )
 
         rule = EfficientGlobalOptimization(
-            num_query_points=args.batch_size,
+            num_query_points=batch_size,
             builder=acquisition_function,
             optimizer=continuous_optimizer,
         )
@@ -249,21 +350,19 @@ def main():
     )
 
     # Run optimization
-    for i in range(args.num_batches):
+    for i in range(num_bo_steps):
 
+        log_regret = save_results(iteration=i, path=path, optimizer=optimizer, minimum=minimum)
+
+        print(f"Batch {i}: Log10 regret {log_regret:.3f}")
         query_batch = optimizer.ask()
         query_values = observer(query_batch)
         optimizer.tell(query_values)
 
-        log_regret = log10_regret(
-            queries=optimizer.to_result().try_get_final_dataset().observations,
-            minimum=minimum,
-        )
 
-        print(f"Batch {i}: Log10 regret {log_regret:.3f}")
+    save_results(iteration=i, path=path, optimizer=optimizer, minimum=minimum)
+
 
 
 if __name__ == "__main__":
     main()
-
-

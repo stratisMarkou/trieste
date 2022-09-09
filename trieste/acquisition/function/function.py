@@ -983,6 +983,116 @@ class batch_monte_carlo_expected_improvement(AcquisitionFunctionClass):
         return tf.reduce_mean(batch_improvement, axis=-1, keepdims=True)  # [..., 1]
 
 
+class AnnealedBatchMonteCarloExpectedImprovement(BatchMonteCarloExpectedImprovement):
+    """
+    Annealed expected improvement for batches of points (or :math:`q`-EI), approximated using Monte Carlo
+    estimation with the reparametrization trick. See :cite:`Ginsbourger2010` for details.
+    Improvement is measured with respect to the minimum predictive mean at observed query points.
+    This is calculated in :class:`BatchMonteCarloExpectedImprovement` by assuming observations
+    at new points are independent from those at known query points. This is faster, but is an
+    approximation for noisy observers.
+    """
+
+    def __init__(self, beta: float, sample_size: int, *, jitter: float = DEFAULTS.JITTER):
+        """
+        :param beta: The annealing strength
+        :param sample_size: The number of samples for each batch of points.
+        :param jitter: The size of the jitter to use when stabilising the Cholesky decomposition of
+            the covariance matrix.
+        :raise tf.errors.InvalidArgumentError: If ``sample_size`` is not positive, or ``jitter``
+            is negative.
+        """
+        self._beta = beta
+
+        super().__init__(
+            sample_size=sample_size,
+            jitter=jitter,
+        )
+
+    def __repr__(self) -> str:
+        """"""
+        return f"AnnealedBatchMonteCarloExpectedImprovement({self._sample_size!r}, jitter={self._jitter!r})"
+
+    def prepare_acquisition_function(
+        self,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        :return: The batch *expected improvement* acquisition function.
+        :raise ValueError (or InvalidArgumentError): If ``dataset`` is not populated, or ``model``
+            does not have an event shape of [1].
+        """
+        tf.debugging.Assert(dataset is not None, [])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+
+        mean, _ = model.predict(dataset.query_points)
+
+        tf.debugging.assert_shapes(
+            [(mean, ["_", 1])], message="Expected model with event shape [1]."
+        )
+
+        eta = tf.reduce_min(mean, axis=0)
+        return annealed_batch_monte_carlo_expected_improvement(self._beta, self._sample_size, model, eta, self._jitter)
+
+    def update_acquisition_function(
+        self,
+        function: AcquisitionFunction,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param function: The acquisition function to update.
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        """
+        tf.debugging.Assert(dataset is not None, [])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+        tf.debugging.Assert(isinstance(function, annealed_batch_monte_carlo_expected_improvement), [])
+        mean, _ = model.predict(dataset.query_points)
+        eta = tf.reduce_min(mean, axis=0)
+        function.update(eta)  # type: ignore
+        return function
+
+
+class annealed_batch_monte_carlo_expected_improvement(batch_monte_carlo_expected_improvement):
+    def __init__(self, beta: float, sample_size: int, model: HasReparamSampler, eta: TensorType, jitter: float):
+        """
+        :param beta: The strength of annealing to use (high beta: strong annealing, low beta little annealing).
+        :param sample_size: The number of Monte-Carlo samples.
+        :param model: The model of the objective function.
+        :param sampler:  ReparametrizationSampler.
+        :param eta: The "best" observation.
+        :param jitter: The size of the jitter to use when stabilising the Cholesky decomposition of
+            the covariance matrix.
+        :return: The annealed expected improvement function. This function will raise
+            :exc:`ValueError` or :exc:`~tf.errors.InvalidArgumentError` if used with a batch size
+            greater than one.
+        """
+        self._beta = beta
+        super().__init__(
+            sample_size=sample_size,
+            model=model,
+            eta=eta,
+            jitter=jitter
+        )
+
+    @tf.function
+    def __call__(self, x: TensorType) -> TensorType:
+        samples = tf.squeeze(self._sampler.sample(x, jitter=self._jitter), axis=-1)  # [..., S, B]
+        B = samples.shape[-1]
+        diff = self._eta - samples # [..., S, B]
+        zeros = tf.zeros(shape=diff.shape[:-1], dtype=diff.dtype)[..., None] # [..., S, 1]
+        diff_and_zeros = tf.concat([diff, zeros], axis=-1) # [..., S, B+1]
+        log_sum_exp = self._beta * tf.math.reduce_logsumexp(diff_and_zeros / self._beta, axis=-1) # [..., S]
+        log_sum_exp = log_sum_exp - self._beta * tf.math.log(tf.cast(B, dtype=log_sum_exp.dtype))
+        return tf.reduce_mean(log_sum_exp, axis=-1, keepdims=True)  # [..., 1]
+
+
 class MultipleOptimismNegativeLowerConfidenceBound(
     SingleModelVectorizedAcquisitionBuilder[ProbabilisticModel]
 ):
