@@ -1,4 +1,3 @@
-# Trieste
 
 A Bayesian optimization toolbox built on [TensorFlow](https://www.tensorflow.org/). Trieste supports Python 3.7 onwards and uses [semantic versioning](https://semver.org/).
 

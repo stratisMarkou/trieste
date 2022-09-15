@@ -32,6 +32,7 @@ from ...models.interfaces import (
 from ...space import SearchSpace
 from ...types import TensorType
 from ...utils import DEFAULTS
+from ...utils.misc import flatten_leading_dims
 from ..interface import (
     AcquisitionFunction,
     AcquisitionFunctionBuilder,
@@ -720,6 +721,8 @@ class monte_carlo_expected_improvement(AcquisitionFunctionClass):
         return tf.reduce_mean(improvement, axis=-2)  # [..., 1]
 
 
+
+
 class MonteCarloAugmentedExpectedImprovement(
     SingleModelAcquisitionBuilder[SupportsReparamSamplerObservationNoise]
 ):
@@ -982,6 +985,28 @@ class batch_monte_carlo_expected_improvement(AcquisitionFunctionClass):
         batch_improvement = tf.maximum(self._eta - min_sample_per_batch, 0.0)  # [..., S]
         return tf.reduce_mean(batch_improvement, axis=-1, keepdims=True)  # [..., 1]
 
+    def active_proportions(self, x: tf.TensorType) -> TensorType:
+
+        assert tf.rank(x) == 2
+
+        samples = tf.squeeze(self._sampler.sample(x, jitter=self._jitter), axis=-1) # [S, B]
+        eta = self._eta * tf.ones_like(samples[:, :1]) # [S, 1]
+
+        samples_and_eta = tf.concat([eta, samples], axis=1) # [S, B+1]
+        idx = tf.math.argmax(-samples_and_eta, axis=1) # [S]
+
+        # Proportion of samples where at least one point is active
+        single_frequency = tf.reduce_mean(
+            tf.cast(tf.math.greater(idx, tf.zeros_like(idx)), dtype=tf.float32)
+        )
+
+        # Proportion of times a point is the minimizer
+        counts = tf.scatter_nd(idx[:, None], tf.ones_like(idx), shape=[samples.shape[1]+1])
+        counts = tf.cast(counts, dtype=tf.float32)
+        pointwise_frequencies = counts[1:] / tf.reduce_sum(counts)
+
+        return single_frequency, pointwise_frequencies
+
 
 class AnnealedBatchMonteCarloExpectedImprovement(BatchMonteCarloExpectedImprovement):
     """
@@ -1091,6 +1116,107 @@ class annealed_batch_monte_carlo_expected_improvement(batch_monte_carlo_expected
         log_sum_exp = self._beta * tf.math.reduce_logsumexp(diff_and_zeros / self._beta, axis=-1) # [..., S]
         log_sum_exp = log_sum_exp - self._beta * tf.math.log(tf.cast(B, dtype=log_sum_exp.dtype))
         return tf.reduce_mean(log_sum_exp, axis=-1, keepdims=True)  # [..., 1]
+
+
+class DecoupledBatchMonteCarloExpectedImprovement(SingleModelAcquisitionBuilder[HasReparamSampler]):
+
+    def __init__(self, sample_size: int):
+        """
+        :param sample_size: The number of samples for each batch of points.
+        :raise tf.errors.InvalidArgumentError: If ``sample_size`` is not positive, or ``jitter``
+            is negative.
+        """
+        tf.debugging.assert_positive(sample_size)
+        self._sample_size = sample_size
+
+    def __repr__(self) -> str:
+        return f"DecoupledBatchMonteCarloExpectedImprovement({self._sample_size!r})"
+
+    def prepare_acquisition_function(
+        self,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        :return: The batch *expected improvement* acquisition function.
+        :raise ValueError (or InvalidArgumentError): If ``dataset`` is not populated, or ``model``
+            does not have an event shape of [1].
+        """
+        tf.debugging.Assert(dataset is not None, [])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+
+        mean, _ = model.predict(dataset.query_points)
+
+        tf.debugging.assert_shapes(
+            [(mean, ["_", 1])], message="Expected model with event shape [1]."
+        )
+
+        eta = tf.reduce_min(mean, axis=0)
+        return decoupled_batch_monte_carlo_expected_improvement(self._sample_size, model, eta)
+
+    def update_acquisition_function(
+        self,
+        function: AcquisitionFunction,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param function: The acquisition function to update.
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        """
+        tf.debugging.Assert(dataset is not None, [])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+        tf.debugging.Assert(isinstance(function, decoupled_batch_monte_carlo_expected_improvement), [])
+        mean, _ = model.predict(dataset.query_points)
+        eta = tf.reduce_min(mean, axis=0)
+        function.update(eta)  # type: ignore
+        return function
+
+
+class decoupled_batch_monte_carlo_expected_improvement(AcquisitionFunctionClass):
+    def __init__(self, sample_size: int, model: HasTrajectorySampler, eta: TensorType):
+        """
+        :param sample_size: The number of Monte-Carlo samples.
+        :param model: The model of the objective function.
+        :param sampler:  ReparametrizationSampler.
+        :param eta: The "best" observation.
+        :param jitter: The size of the jitter to use when stabilising the Cholesky decomposition of
+            the covariance matrix.
+        :return: The expected improvement function. This function will raise
+            :exc:`ValueError` or :exc:`~tf.errors.InvalidArgumentError` if used with a batch size
+            greater than one.
+        """
+        self._sample_size = sample_size
+
+        if not isinstance(model, HasReparamSampler):
+            raise ValueError(
+                f"The batch Monte-Carlo expected improvement acquisition function only supports "
+                f"models that implement a reparam_sampler method; received {model.__repr__()}"
+            )
+
+        self._trajectory_sampler = model.trajectory_sampler()
+        self._trajectory = self._trajectory_sampler.get_trajectory()
+        self._eta = tf.Variable(eta)
+
+    def update(self, eta: TensorType) -> None:
+        """Update the acquisition function with a new eta value and reset the trajectory sampler."""
+        self._eta.assign(eta)
+        self._trajectory = self._trajectory_sampler.update_trajectory(self._trajectory)
+
+    @tf.function
+    def __call__(self, x: TensorType) -> TensorType: # [N, B, D] -> [N, 1]
+        x_flat, unflatten = flatten_leading_dims(x) # [N*B, D]
+        x_flat_tiled = tf.tile(x_flat[:, None, :], [1, self._sample_size, 1]) # [N*B, S, D]
+        samples_flat = self._trajectory(x_flat_tiled) # [N*B, S, 1]
+        samples = unflatten(samples_flat[:,:,0]) # [N, B, S]
+        min_sample_per_batch = tf.reduce_min(samples,1) # [N, S]
+        improvement_per_batch = tf.maximum(self._eta - min_sample_per_batch, 0.0) # [N, S]
+        return tf.reduce_mean(improvement_per_batch, axis=-1, keepdims=True)  # [N, 1]
 
 
 class MultipleOptimismNegativeLowerConfidenceBound(

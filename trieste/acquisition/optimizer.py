@@ -211,6 +211,8 @@ def generate_continuous_optimizer(
     def optimize_continuous(
         space: Box | TaggedProductSearchSpace,
         target_func: Union[AcquisitionFunction, Tuple[AcquisitionFunction, int]],
+        initial_points: TensorType | None = None,
+        return_best_only: bool = True,
     ) -> TensorType:
         """
         A gradient-based :const:`AcquisitionOptimizer` for :class:'Box'
@@ -239,31 +241,36 @@ def generate_continuous_optimizer(
         if V < 0:
             raise ValueError(f"vectorization must be positive, got {V}")
 
-        candidates = space.sample(num_initial_samples)[:, None, :]  # [num_initial_samples, 1, D]
-        tiled_candidates = tf.tile(candidates, [1, V, 1])  # [num_initial_samples, V, D]
+        if initial_points is None:
 
-        target_func_values = target_func(tiled_candidates)  # [num_samples, V]
-        tf.debugging.assert_shapes(
-            [(target_func_values, ("_", V))],
-            message=(
-                f"""
-                The result of function target_func has shape
-                {tf.shape(target_func_values)}, however, expected a trailing
-                dimension of size {V}.
-                """
-            ),
-        )
+            candidates = space.sample(num_initial_samples)[:, None, :]  # [num_initial_samples, 1, D]
+            tiled_candidates = tf.tile(candidates, [1, V, 1])  # [num_initial_samples, V, D]
+            print(f"optimize continuous: tiled_candidates {tiled_candidates.shape}")
 
-        _, top_k_indices = tf.math.top_k(
-            tf.transpose(target_func_values), k=num_optimization_runs
-        )  # [1, num_optimization_runs] or [V, num_optimization_runs]
+            target_func_values = target_func(tiled_candidates)  # [num_samples, V]
+            tf.debugging.assert_shapes(
+                [(target_func_values, ("_", V))],
+                message=(
+                    f"""
+                    The result of function target_func has shape
+                    {tf.shape(target_func_values)}, however, expected a trailing
+                    dimension of size {V}.
+                    """
+                ),
+            )
 
-        tiled_candidates = tf.transpose(tiled_candidates, [1, 0, 2])  # [V, num_initial_samples, D]
-        top_k_points = tf.gather(
-            tiled_candidates, top_k_indices, batch_dims=1
-        )  # [V, num_optimization_runs, D]
-        initial_points = tf.transpose(top_k_points, [1, 0, 2])  # [num_optimization_runs,V,D]
+            _, top_k_indices = tf.math.top_k(
+                tf.transpose(target_func_values), k=num_optimization_runs
+            )  # [1, num_optimization_runs] or [V, num_optimization_runs]
 
+            tiled_candidates = tf.transpose(tiled_candidates, [1, 0, 2])  # [V, num_initial_samples, D]
+            top_k_points = tf.gather(
+                tiled_candidates, top_k_indices, batch_dims=1
+            )  # [V, num_optimization_runs, D]
+            initial_points = tf.transpose(top_k_points, [1, 0, 2])  # [num_optimization_runs,V,D]
+
+        print(f"optimize continuous: initial_points.shape {initial_points.shape}")
+        print(f"optimize continuous: num_initial_samples {num_initial_samples}")
         (
             successes,
             fun_values,
@@ -346,12 +353,19 @@ def generate_continuous_optimizer(
                 else:
                     logging.histogram("spo_improvement_on_initial_samples", improvements)
 
-        best_run_ids = tf.math.argmax(fun_values, axis=0)  # [V]
-        chosen_points = tf.gather(
-            tf.transpose(chosen_x, [1, 0, 2]), best_run_ids, batch_dims=1
-        )  # [V, D]
+        if return_best_only:
 
-        return chosen_points
+            best_run_ids = tf.math.argmax(fun_values, axis=0)  # [V]
+            chosen_points = tf.gather(
+                tf.transpose(chosen_x, [1, 0, 2]), best_run_ids, batch_dims=1
+            )  # [V, D]
+
+            return chosen_points
+
+        else:
+            return chosen_x
+
+
 
     return optimize_continuous
 
@@ -580,6 +594,8 @@ def batchify_joint(
     def optimizer(
         search_space: SearchSpaceType,
         f: Union[AcquisitionFunction, Tuple[AcquisitionFunction, int]],
+        initial_points: TensorType | None = None,
+        return_best_only: bool = True,
     ) -> TensorType:
         expanded_search_space = search_space ** batch_size  # points have shape [B * D]
 
@@ -594,9 +610,18 @@ def batchify_joint(
         ) -> TensorType:  # [..., 1, B * D] -> [..., 1]
             return af(tf.reshape(x, x.shape[:-2].as_list() + [batch_size, -1]))
 
-        vectorized_points = batch_size_one_optimizer(  # [1, B * D]
-            expanded_search_space, target_func_with_vectorized_inputs
+        if initial_points is not None:
+            print(f"optimizer: initial_points.shape {initial_points.shape}")
+            initial_points = tf.reshape(initial_points, initial_points.shape[:-2].as_list() + [batch_size, -1])
+
+        vectorized_points = batch_size_one_optimizer(  # [..., 1, B * D]
+            expanded_search_space,
+            target_func_with_vectorized_inputs,
+            initial_points=initial_points,
+            return_best_only=return_best_only,
         )
+        print(f"optimizer: vectorized_points.shape {vectorized_points.shape}")
+        input("")
         return tf.reshape(vectorized_points, [batch_size, -1])  # [B, D]
 
     return optimizer

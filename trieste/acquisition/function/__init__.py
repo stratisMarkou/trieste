@@ -36,6 +36,7 @@ from .entropy import (
 from .function import (
     AugmentedExpectedImprovement,
     BatchMonteCarloExpectedImprovement,
+    DecoupledBatchMonteCarloExpectedImprovement,
     AnnealedBatchMonteCarloExpectedImprovement,
     ExpectedConstrainedImprovement,
     ExpectedImprovement,

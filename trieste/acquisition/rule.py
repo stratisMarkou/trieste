@@ -228,6 +228,7 @@ class EfficientGlobalOptimization(
         self._optimizer = optimizer
         self._num_query_points = num_query_points
         self._acquisition_function: Optional[AcquisitionFunction] = initial_acquisition_function
+        self._step = 0
 
     def __repr__(self) -> str:
         """"""
@@ -276,6 +277,16 @@ class EfficientGlobalOptimization(
         with tf.name_scope("EGO.optimizer" + "[0]" * greedy):
             points = self._optimizer(search_space, self._acquisition_function)
 
+        if hasattr(self._acquisition_function, "active_proportions"):
+            single_frequency, pointwise_frequencies = self._acquisition_function.active_proportions(x=points)
+
+        dist = tf.math.sqrt(tf.reduce_sum((points[None, :, :] - points[:, None, :])**2., axis=-1))
+        ones = tf.ones(shape=dist.shape, dtype=tf.int64)
+        upper_ones = tf.linalg.band_part(ones, 0, -1)
+        upper_ones = upper_ones - tf.linalg.diag(tf.linalg.diag_part(upper_ones))
+        mask = upper_ones == tf.ones_like(upper_ones)
+        log10_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,))) / tf.math.log(10.)
+
         if summary_writer:
             with summary_writer.as_default(step=step_number):
                 batched_points = tf.expand_dims(points, axis=0)
@@ -289,7 +300,189 @@ class EfficientGlobalOptimization(
                         "EGO.acquisition_function/maximum_found" + "[0]" * greedy, values
                     )
 
+                if hasattr(self._acquisition_function, "active_proportions"):
+                    logging.scalar("EGO.mc_active_single_frequency", single_frequency, step=self._step)
+                    logging.histogram("EGO.mc_active_pointwise_frequencies", pointwise_frequencies, step=self._step)
+
+                logging.histogram("EGO.batch_pairwise_log10_distances", log10_dist, step=self._step)
+
+                self._step = self._step + 1
+
         if isinstance(self._builder, GreedyAcquisitionFunctionBuilder):
+            for i in range(
+                self._num_query_points - 1
+            ):  # greedily allocate remaining batch elements
+                self._acquisition_function = self._builder.update_acquisition_function(
+                    self._acquisition_function,
+                    models,
+                    datasets=datasets,
+                    pending_points=points,
+                    new_optimization_step=False,
+                )
+                with tf.name_scope(f"EGO.optimizer[{i+1}]"):
+                    chosen_point = self._optimizer(search_space, self._acquisition_function)
+                points = tf.concat([points, chosen_point], axis=0)
+
+                if summary_writer:
+                    with summary_writer.as_default(step=step_number):
+                        batched_points = tf.expand_dims(chosen_point, axis=0)
+                        values = self._acquisition_function(batched_points)[0]
+                        if len(values) == 1:
+                            logging.scalar(
+                                f"EGO.acquisition_function/maximum_found[{i + 1}]", values[0]
+                            )
+                        else:  # vectorized acquisition function
+                            logging.histogram(
+                                f"EGO.acquisition_function/maximum_found[{i+1}]", values
+                            )
+
+        return points
+
+
+class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization):
+
+    def __init__(
+        self,
+        builder: Optional[
+            AcquisitionFunctionBuilder[ProbabilisticModelType]
+            | GreedyAcquisitionFunctionBuilder[ProbabilisticModelType]
+            | VectorizedAcquisitionFunctionBuilder[ProbabilisticModelType]
+            | SingleModelAcquisitionBuilder[ProbabilisticModelType]
+            | SingleModelGreedyAcquisitionBuilder[ProbabilisticModelType]
+            | SingleModelVectorizedAcquisitionBuilder[ProbabilisticModelType]
+        ] = None,
+        pre_builders: Optional[
+            List[
+                AcquisitionFunctionBuilder[ProbabilisticModelType]
+                | GreedyAcquisitionFunctionBuilder[ProbabilisticModelType]
+                | VectorizedAcquisitionFunctionBuilder[ProbabilisticModelType]
+                | SingleModelAcquisitionBuilder[ProbabilisticModelType]
+                | SingleModelGreedyAcquisitionBuilder[ProbabilisticModelType]
+                | SingleModelVectorizedAcquisitionBuilder[ProbabilisticModelType]
+            ]
+        ] | None = None,
+        optimizer: AcquisitionOptimizer[SearchSpaceType] | None = None,
+        num_query_points: int = 1,
+        initial_acquisition_function: Optional[AcquisitionFunction] = None,
+    ):
+
+        super().__init__(
+            builder=builder,
+            optimizer=optimizer,
+            num_query_points=num_query_points,
+            initial_acquisition_function=initial_acquisition_function,
+        )
+
+        if pre_builders is None:
+            self._pre_builders = None
+        else:
+            self._pre_builders = [pre_builder.using(OBJECTIVE) for pre_builder in pre_builders]
+
+        self._pre_acquisition_functions = None
+
+
+    def acquire(
+        self,
+        search_space: SearchSpaceType,
+        models: Mapping[str, ProbabilisticModelType],
+        datasets: Optional[Mapping[str, Dataset]] = None,
+    ) -> TensorType:
+        """
+        Return the query point(s) that optimizes the acquisition function produced by ``builder``
+        (see :meth:`__init__`).
+
+        :param search_space: The local acquisition search space for *this step*.
+        :param models: The model for each tag.
+        :param datasets: The known observer query points and observations. Whether this is required
+            depends on the acquisition function used.
+        :return: The single (or batch of) points to query.
+        """
+        print(datasets)
+        if self._acquisition_function is None:
+            self._acquisition_function = self._builder.prepare_acquisition_function(
+                models,
+                datasets=datasets,
+            )
+
+        else:
+            self._acquisition_function = self._builder.update_acquisition_function(
+                self._acquisition_function,
+                models,
+                datasets=datasets,
+            )
+
+        if self._pre_builders is not None and self._pre_acquisition_functions is None:
+            print(type(self._pre_builders[0]))
+            self._pre_acquisition_functions = [
+                builder.prepare_acquisition_function(
+                    models,
+                    datasets=datasets,
+                ) for builder in self._pre_builders
+            ]
+
+        elif self._pre_builders is not None:
+            self._pre_acquisition_functions = [
+                builder.update_acquisition_function(
+                    pre_acquisition_function,
+                    models,
+                    datasets=datasets,
+                ) for builder, prepare_acquisition_function in zip(self._pre_builders, self._pre_acquisition_functions)
+            ]
+
+        summary_writer = logging.get_tensorboard_writer()
+        step_number = logging.get_step_number()
+        greedy = isinstance(self._builder, GreedyAcquisitionFunctionBuilder)
+
+        points = None
+        if self._pre_builders is not None:
+            for pre_acquisition_function in self._pre_acquisition_functions:
+                points = self._optimizer(
+                    search_space,
+                    self._acquisition_function,
+                    initial_points=points,
+                    return_best_only=False,
+                )
+
+        with tf.name_scope("EGO.optimizer" + "[0]" * greedy):
+            points = self._optimizer(
+                search_space,
+                self._acquisition_function,
+                initial_points=points,
+            )
+
+        if hasattr(self._acquisition_function, "active_proportions"):
+            single_frequency, pointwise_frequencies = self._acquisition_function.active_proportions(x=points)
+
+        dist = tf.math.sqrt(tf.reduce_sum((points[None, :, :] - points[:, None, :])**2., axis=-1))
+        ones = tf.ones(shape=dist.shape, dtype=tf.int64)
+        upper_ones = tf.linalg.band_part(ones, 0, -1)
+        upper_ones = upper_ones - tf.linalg.diag(tf.linalg.diag_part(upper_ones))
+        mask = upper_ones == tf.ones_like(upper_ones)
+        log10_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,))) / tf.math.log(10.)
+
+        if summary_writer:
+            with summary_writer.as_default(step=step_number):
+                batched_points = tf.expand_dims(points, axis=0)
+                values = self._acquisition_function(batched_points)[0]
+                if len(values) == 1:
+                    logging.scalar(
+                        "EGO.acquisition_function/maximum_found" + "[0]" * greedy, values[0]
+                    )
+                else:  # vectorized acquisition function
+                    logging.histogram(
+                        "EGO.acquisition_function/maximum_found" + "[0]" * greedy, values
+                    )
+
+                if hasattr(self._acquisition_function, "active_proportions"):
+                    logging.scalar("EGO.mc_active_single_frequency", single_frequency, step=self._step)
+                    logging.histogram("EGO.mc_active_pointwise_frequencies", pointwise_frequencies, step=self._step)
+
+                logging.histogram("EGO.batch_pairwise_log10_distances", log10_dist, step=self._step)
+
+                self._step = self._step + 1
+
+        if isinstance(self._builder, GreedyAcquisitionFunctionBuilder):
+            raise Exception
             for i in range(
                 self._num_query_points - 1
             ):  # greedily allocate remaining batch elements
