@@ -245,7 +245,6 @@ def generate_continuous_optimizer(
 
             candidates = space.sample(num_initial_samples)[:, None, :]  # [num_initial_samples, 1, D]
             tiled_candidates = tf.tile(candidates, [1, V, 1])  # [num_initial_samples, V, D]
-            print(f"optimize continuous: tiled_candidates {tiled_candidates.shape}")
 
             target_func_values = target_func(tiled_candidates)  # [num_samples, V]
             tf.debugging.assert_shapes(
@@ -269,8 +268,6 @@ def generate_continuous_optimizer(
             )  # [V, num_optimization_runs, D]
             initial_points = tf.transpose(top_k_points, [1, 0, 2])  # [num_optimization_runs,V,D]
 
-        print(f"optimize continuous: initial_points.shape {initial_points.shape}")
-        print(f"optimize continuous: num_initial_samples {num_initial_samples}")
         (
             successes,
             fun_values,
@@ -597,6 +594,7 @@ def batchify_joint(
         initial_points: TensorType | None = None,
         return_best_only: bool = True,
     ) -> TensorType:
+
         expanded_search_space = search_space ** batch_size  # points have shape [B * D]
 
         if isinstance(f, tuple):
@@ -610,19 +608,20 @@ def batchify_joint(
         ) -> TensorType:  # [..., 1, B * D] -> [..., 1]
             return af(tf.reshape(x, x.shape[:-2].as_list() + [batch_size, -1]))
 
-        if initial_points is not None:
-            print(f"optimizer: initial_points.shape {initial_points.shape}")
-            initial_points = tf.reshape(initial_points, initial_points.shape[:-2].as_list() + [batch_size, -1])
-
         vectorized_points = batch_size_one_optimizer(  # [..., 1, B * D]
             expanded_search_space,
             target_func_with_vectorized_inputs,
             initial_points=initial_points,
             return_best_only=return_best_only,
         )
-        print(f"optimizer: vectorized_points.shape {vectorized_points.shape}")
-        input("")
-        return tf.reshape(vectorized_points, [batch_size, -1])  # [B, D]
+
+        if return_best_only:
+            return tf.reshape(vectorized_points, [batch_size, -1])
+
+        else:
+            return vectorized_points
+
+        # return tf.reshape(vectorized_points, [batch_size, -1])  # [B, D]
 
     return optimizer
 

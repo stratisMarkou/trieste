@@ -60,6 +60,11 @@ standard_objectives = {
         HARTMANN_6_MINIMUM,
         HARTMANN_6_SEARCH_SPACE,
     ),
+    "ackley_5": (
+        ackley_5,
+        ACKLEY_5_MINIMUM,
+        ACKLEY_5_SEARCH_SPACE,
+    ),
 }
 
 
@@ -204,9 +209,9 @@ def main():
     )
 
     parser.add_argument(
-        "--num_amcei_halvings",
+        "--num_amcei_steps",
         type=int,
-        default=None,
+        default=0,
     )
 
     parser.add_argument(
@@ -219,6 +224,12 @@ def main():
         "--linear_stddev",
         type=float,
         default=1e-6,
+    )
+
+    parser.add_argument(
+        "--gtol",
+        type=float,
+        default=1e-20,
     )
 
     parser.add_argument(
@@ -321,9 +332,9 @@ def main():
 
             pre_acquisition_functions = [
                 AnnealedBatchMonteCarloExpectedImprovement(
-                    beta=args.beta*2**i,
+                    beta=args.beta*2**-i,
                     sample_size=args.num_mcei_samples,
-                ) for i in range(args.num_amcei_halvings+1)
+                ) for i in range(args.num_amcei_steps+1)
             ]
 
             acquisition_function = BatchMonteCarloExpectedImprovement(
@@ -334,7 +345,7 @@ def main():
             batch_size = args.batch_size
             initial_design_split_size = args.num_initial_designs
 
-        optimizer_args = {"options": {"gtol" : 1e-20}}
+        optimizer_args = {"options": {"gtol" : args.gtol}}
 
         continuous_optimizer = generate_continuous_optimizer(
             num_initial_samples=args.num_initial_designs,
@@ -364,14 +375,12 @@ def main():
 
     # Run optimization
     for i in range(num_bo_steps):
-
         log_regret = save_results(iteration=i, path=path, optimizer=optimizer, minimum=minimum)
         print(f"Batch {i}: Log10 regret {log_regret:.3f}")
         
         query_batch = optimizer.ask()
         query_values = observer(query_batch)
         optimizer.tell(query_values)
-
 
     log_regret = save_results(iteration=i+1, path=path, optimizer=optimizer, minimum=minimum)
     print(f"Batch {i+1}: Log10 regret {log_regret:.3f}")

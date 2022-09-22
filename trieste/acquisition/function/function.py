@@ -721,8 +721,6 @@ class monte_carlo_expected_improvement(AcquisitionFunctionClass):
         return tf.reduce_mean(improvement, axis=-2)  # [..., 1]
 
 
-
-
 class MonteCarloAugmentedExpectedImprovement(
     SingleModelAcquisitionBuilder[SupportsReparamSamplerObservationNoise]
 ):

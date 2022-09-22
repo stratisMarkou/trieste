@@ -285,7 +285,8 @@ class EfficientGlobalOptimization(
         upper_ones = tf.linalg.band_part(ones, 0, -1)
         upper_ones = upper_ones - tf.linalg.diag(tf.linalg.diag_part(upper_ones))
         mask = upper_ones == tf.ones_like(upper_ones)
-        log10_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,))) / tf.math.log(10.)
+        log_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,)))
+        log10_dist = log_dist / tf.cast(tf.math.log(10.), dtype=tf.float64)
 
         if summary_writer:
             with summary_writer.as_default(step=step_number):
@@ -397,7 +398,6 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
             depends on the acquisition function used.
         :return: The single (or batch of) points to query.
         """
-        print(datasets)
         if self._acquisition_function is None:
             self._acquisition_function = self._builder.prepare_acquisition_function(
                 models,
@@ -412,13 +412,14 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
             )
 
         if self._pre_builders is not None and self._pre_acquisition_functions is None:
-            print(type(self._pre_builders[0]))
             self._pre_acquisition_functions = [
                 builder.prepare_acquisition_function(
                     models,
                     datasets=datasets,
                 ) for builder in self._pre_builders
             ]
+            for acq_fn in self._pre_acquisition_functions:
+                acq_fn._sampler = self.acquisition_function._sampler
 
         elif self._pre_builders is not None:
             self._pre_acquisition_functions = [
@@ -426,8 +427,10 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
                     pre_acquisition_function,
                     models,
                     datasets=datasets,
-                ) for builder, prepare_acquisition_function in zip(self._pre_builders, self._pre_acquisition_functions)
+                ) for builder, pre_acquisition_function in zip(self._pre_builders, self._pre_acquisition_functions)
             ]
+            for acq_fn in self._pre_acquisition_functions:
+                acq_fn._sampler = self.acquisition_function._sampler
 
         summary_writer = logging.get_tensorboard_writer()
         step_number = logging.get_step_number()
@@ -438,7 +441,7 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
             for pre_acquisition_function in self._pre_acquisition_functions:
                 points = self._optimizer(
                     search_space,
-                    self._acquisition_function,
+                    pre_acquisition_function,
                     initial_points=points,
                     return_best_only=False,
                 )
@@ -458,7 +461,8 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
         upper_ones = tf.linalg.band_part(ones, 0, -1)
         upper_ones = upper_ones - tf.linalg.diag(tf.linalg.diag_part(upper_ones))
         mask = upper_ones == tf.ones_like(upper_ones)
-        log10_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,))) / tf.math.log(10.)
+        log_dist = tf.math.log(tf.reshape(tf.boolean_mask(dist, mask), (-1,)))
+        log10_dist = log_dist / tf.cast(tf.math.log(10.), dtype=tf.float64)
 
         if summary_writer:
             with summary_writer.as_default(step=step_number):
@@ -482,7 +486,6 @@ class EfficientGlobalOptimizationWithPreOptimization(EfficientGlobalOptimization
                 self._step = self._step + 1
 
         if isinstance(self._builder, GreedyAcquisitionFunctionBuilder):
-            raise Exception
             for i in range(
                 self._num_query_points - 1
             ):  # greedily allocate remaining batch elements
