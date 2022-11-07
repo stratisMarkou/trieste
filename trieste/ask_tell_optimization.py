@@ -73,6 +73,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         models: Mapping[str, TrainableProbabilisticModelType],
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -87,6 +88,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         ],
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -102,6 +104,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         acquisition_state: StateType | None,
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -113,6 +116,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         models: TrainableProbabilisticModelType,
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -127,6 +131,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         ],
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -142,6 +147,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         acquisition_state: StateType | None = None,
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         ...
 
@@ -159,6 +165,7 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         acquisition_state: StateType | None = None,
         *,
         fit_model: bool = True,
+        optimize_model: bool = True,
     ):
         """
         :param search_space: The space over which to search for the next query point.
@@ -223,7 +230,9 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
                 for tag, model in self._models.items():
                     dataset = datasets[tag]
                     model.update(dataset)
-                    model.optimize(dataset)
+                    
+                    if optimize_model:
+                        model.optimize(dataset)
 
             summary_writer = logging.get_tensorboard_writer()
             if summary_writer:
@@ -379,10 +388,16 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
         # so code below is needed to cater for both cases
 
         with Timer() as query_point_generation_timer:
-            points_or_stateful = self._acquisition_rule.acquire(
+            results = self._acquisition_rule.acquire(
                 self._search_space, self._models, datasets=self._datasets
             )
-
+            
+            if type(results) == tuple:
+                points_or_stateful, optimisation_results = results
+                
+            else:
+                points_or_stateful, optimisation_results = results, None
+                
         if callable(points_or_stateful):
             self._acquisition_state, query_points = points_or_stateful(self._acquisition_state)
         else:
@@ -400,9 +415,9 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
                     self._query_plot_dfs,
                 )
 
-        return query_points
+        return query_points, optimisation_results
 
-    def tell(self, new_data: Mapping[str, Dataset] | Dataset) -> None:
+    def tell(self, new_data: Mapping[str, Dataset] | Dataset, optimize_model=True) -> None:
         """Updates optimizer state with new data.
 
         :param new_data: New observed data.
@@ -424,7 +439,9 @@ class AskTellOptimizer(Generic[SearchSpaceType, TrainableProbabilisticModelType]
             for tag, model in self._models.items():
                 dataset = self._datasets[tag]
                 model.update(dataset)
-                model.optimize(dataset)
+                
+                if optimize_model:
+                    model.optimize(dataset)
 
         summary_writer = logging.get_tensorboard_writer()
         if summary_writer:

@@ -10,6 +10,7 @@ from trieste.acquisition.optimizer import generate_continuous_optimizer
 from gpflux.layers.basis_functions.fourier_features import RandomFourierFeaturesCosine
 
 import matplotlib.pyplot as plt
+import pickle
 
 
 objective_kernels = {
@@ -120,16 +121,8 @@ def set_up_logging(args, summary):
     if os.path.exists(f"{path}/log"):
         shutil.rmtree(f"{path}/log")
 
-    if os.path.exists(f"{path}/figs"):
-        shutil.rmtree(f"{path}/figs")
-
     if os.path.exists(f"{path}/time.txt"):
         os.remove(f"{path}/time.txt")
-        
-    os.makedirs(f"{path}/figs", exist_ok=True)
-
-    # summary_writer = tf.summary.create_file_writer(f"{path}/log")
-    # trieste.logging.set_tensorboard_writer(summary_writer)
 
     return path
 
@@ -174,3 +167,67 @@ def plot_2D_results(optimizer, path, filename):
     plt.savefig(f"{path}/figs/{filename}")
     plt.close()
     
+
+def build_model(
+        dataset,
+        trainable_noise,
+        kernel=None
+    ):
+    """
+    :param dataset:
+    :param trainable_noise:
+    :param kernel:
+    :return:
+    """
+
+    variance = tf.math.reduce_variance(dataset.observations)
+
+    if kernel is None:
+        kernel = gpflow.kernels.Matern52(variance=variance)
+
+    else:
+        kernel = kernel(variance)
+
+    gpr = gpflow.models.GPR(dataset.astuple(), kernel, noise_variance=1e-4)
+
+    if not trainable_noise:
+        gpflow.set_trainable(gpr.likelihood, False)
+
+    return GaussianProcessRegression(gpr)
+
+
+def log10_regret(queries, minimum):
+    """
+    :param queries:
+    :param minimum:
+    :return:
+    """
+    regret = tf.reshape(tf.reduce_min(queries) - minimum, shape=())
+    return tf.math.log(regret) / tf.cast(tf.math.log(10.), dtype=regret.dtype)
+
+
+def save_results(
+        iteration,
+        path,
+        optimizer,
+        minimum,
+        optimisation_results=None,
+        dt=None
+    ):
+
+    observations = optimizer.to_result().try_get_final_dataset().observations
+    log_regret = log10_regret(queries=observations, minimum=minimum)
+
+    with open(f"{path}/log-regret.txt", "a") as file:
+        file.write(f"{iteration}, {observations.shape[0]}, {log_regret}\n")
+        file.close()
+
+    with open(f"{path}/time.txt", "a") as file:
+        file.write(f"{iteration}, {dt or 0.}\n")
+        file.close()
+        
+    if optimisation_results is not None:
+        with open(f"{path}/step-{iteration}.pickle", "wb") as handle:
+            pickle.dump(optimisation_results, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return log_regret

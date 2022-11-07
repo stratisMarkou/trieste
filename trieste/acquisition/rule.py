@@ -274,7 +274,7 @@ class EfficientGlobalOptimization(
         greedy = isinstance(self._builder, GreedyAcquisitionFunctionBuilder)
 
         with tf.name_scope("EGO.optimizer" + "[0]" * greedy):
-            points = self._optimizer(search_space, self._acquisition_function)
+            points, optimisation_results = self._optimizer(search_space, self._acquisition_function)
 
         if summary_writer:
             with summary_writer.as_default(step=step_number):
@@ -290,6 +290,7 @@ class EfficientGlobalOptimization(
                     )
 
         if isinstance(self._builder, GreedyAcquisitionFunctionBuilder):
+            optimisation_results = []
             for i in range(
                 self._num_query_points - 1
             ):  # greedily allocate remaining batch elements
@@ -301,8 +302,9 @@ class EfficientGlobalOptimization(
                     new_optimization_step=False,
                 )
                 with tf.name_scope(f"EGO.optimizer[{i+1}]"):
-                    chosen_point = self._optimizer(search_space, self._acquisition_function)
+                    chosen_point, _optimisation_results = self._optimizer(search_space, self._acquisition_function)
                 points = tf.concat([points, chosen_point], axis=0)
+                optimisation_results.append(_optimisation_results)
 
                 if summary_writer:
                     with summary_writer.as_default(step=step_number):
@@ -317,7 +319,7 @@ class EfficientGlobalOptimization(
                                 f"EGO.acquisition_function/maximum_found[{i+1}]", values
                             )
 
-        return points
+        return points, optimisation_results
 
 
 @dataclass(frozen=True)

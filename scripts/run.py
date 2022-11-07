@@ -7,52 +7,7 @@ import argparse
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-import tensorflow as tf
-import gpflow
-import numpy as np
-
-from gpflow.utilities import print_summary
-
-import trieste
-from trieste.models.gpflow.models import GaussianProcessRegression
-from trieste.ask_tell_optimization import AskTellOptimizer
-from trieste.acquisition.optimizer import generate_continuous_optimizer
-
-from trieste.acquisition.rule import (
-    RandomSampling,
-    EfficientGlobalOptimization,
-    # EfficientGlobalOptimizationWithPreOptimization,
-)
-
-from trieste.models.gpflow.builders import (
-    build_gpr,
-)
-
-from trieste.acquisition.function import (
-    ExpectedImprovement,
-    BatchMonteCarloExpectedImprovement,
-    BatchExpectedImprovement,
-    GreedyContinuousThompsonSampling,
-    # DecoupledBatchMonteCarloExpectedImprovement,
-    # AnnealedBatchMonteCarloExpectedImprovement,
-)
-
-from trieste.acquisition.utils import split_acquisition_function_calls
-
-from trieste.objectives.utils import mk_observer
-from trieste.objectives.single_objectives import *
-
-from utils import (
-    make_gp_objective,
-    arg_summary,
-    set_up_logging,
-    gp_objectives,
-    plot_2D_results,
-)
-
 from time import time
-import pickle
-
 
 standard_objectives = {
     # "scaled_branin": (
@@ -83,65 +38,6 @@ standard_objectives = {
 }
 
 
-
-def build_model(
-        dataset: trieste.data.Dataset,
-        trainable_noise: bool,
-        kernel=None
-    ) -> GaussianProcessRegression:
-    """
-    :param dataset:
-    :param trainable_noise:
-    :param kernel:
-    :return:
-    """
-
-    variance = tf.math.reduce_variance(dataset.observations)
-
-    if kernel is None:
-        kernel = gpflow.kernels.Matern52(variance=variance)
-
-    else:
-        kernel = kernel(variance)
-
-    gpr = gpflow.models.GPR(dataset.astuple(), kernel, noise_variance=1e-4)
-
-    if not trainable_noise:
-        gpflow.set_trainable(gpr.likelihood, False)
-
-    return GaussianProcessRegression(gpr)
-
-
-def log10_regret(queries: tf.Tensor, minimum: tf.Tensor) -> tf.Tensor:
-    """
-    :param queries:
-    :param minimum:
-    :return:
-    """
-    regret = tf.reshape(tf.reduce_min(queries) - minimum, shape=())
-    return tf.math.log(regret) / tf.cast(tf.math.log(10.), dtype=regret.dtype)
-
-
-def save_results(iteration, path, optimizer, minimum, optimisation_results=None, dt=None):
-
-    observations = optimizer.to_result().try_get_final_dataset().observations
-    log_regret = log10_regret(queries=observations, minimum=minimum)
-
-    with open(f"{path}/log-regret.txt", "a") as file:
-        file.write(f"{iteration}, {observations.shape[0]}, {log_regret}\n")
-        file.close()
-
-    with open(f"{path}/time.txt", "a") as file:
-        file.write(f"{iteration}, {dt or 0.}\n")
-        file.close()
-        
-    if optimisation_results is not None:
-        with open(f"{path}/step-{iteration}.pickle", "wb") as handle:
-            pickle.dump(optimisation_results, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-    return log_regret
-
-
 def main():
 
     parser = argparse.ArgumentParser()
@@ -162,7 +58,12 @@ def main():
     parser.add_argument(
         "objective",
         type=str,
-        choices=gp_objectives,
+        choices=[
+            "eq",
+            "matern12",
+            "matern32",
+            "matern52",
+        ],
     )
 
     parser.add_argument(
@@ -285,11 +186,56 @@ def main():
 
     # Parse arguments and print argument summary
     args = parser.parse_args()
-    summary = arg_summary(args)
-    print(summary)
     
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
+    import tensorflow as tf
+    import gpflow
+    import numpy as np
+
+    from gpflow.utilities import print_summary
+
+    import trieste
+    from trieste.models.gpflow.models import GaussianProcessRegression
+    from trieste.ask_tell_optimization import AskTellOptimizer
+    from trieste.acquisition.optimizer import generate_continuous_optimizer
+
+    from trieste.acquisition.rule import (
+        RandomSampling,
+        EfficientGlobalOptimization,
+        # EfficientGlobalOptimizationWithPreOptimization,
+    )
+
+    from trieste.models.gpflow.builders import (
+        build_gpr,
+    )
+
+    from trieste.acquisition.function import (
+        ExpectedImprovement,
+        BatchMonteCarloExpectedImprovement,
+        BatchExpectedImprovement,
+        GreedyContinuousThompsonSampling,
+    )
+
+    from trieste.acquisition.utils import split_acquisition_function_calls
+    from trieste.objectives.utils import mk_observer
+    
+
+    from utils import (
+        make_gp_objective,
+        arg_summary,
+        set_up_logging,
+        gp_objectives,
+        plot_2D_results,
+        build_model,
+        log10_regret,
+        save_results,
+    )
+
+    
+    summary = arg_summary(args)
+    # print(summary)
+    
     assert not (args.objective in gp_objectives and args.objective_dimension == -1)
     
     dtype = tf.float64
@@ -444,8 +390,6 @@ def main():
         start = time()
         query_batch, optimisation_results = optimizer.ask()
         dt = time() - start
-        
-        # print_summary(model.model)
         
         query_values = observer(query_batch)
         optimizer.tell(
