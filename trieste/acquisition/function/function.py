@@ -1035,6 +1035,167 @@ class batch_monte_carlo_expected_improvement(AcquisitionFunctionClass):
         return tf.reduce_mean(batch_improvement, axis=-1, keepdims=True)  # [..., 1]
 
 
+class BatchControlVariateExpectedImprovement(BatchMonteCarloExpectedImprovement):
+
+    def __init__(self, sample_size: int, *, coeff_mode: str, jitter: float = DEFAULTS.JITTER):
+        """
+        :param sample_size: The number of samples for each batch of points.
+        :param coeff_mode: Speficies which coeffient to use in front of the control variate
+            variable, can be either "mean" or "cv".
+        :param jitter: The size of the jitter to use when stabilising the Cholesky decomposition of
+            the covariance matrix.
+        :raise tf.errors.InvalidArgumentError: If ``sample_size`` is not positive, or ``jitter``
+            is negative.
+        """
+        tf.debugging.assert_positive(sample_size)
+        tf.debugging.assert_greater_equal(jitter, 0.0)
+
+        self._coeff_mode = coeff_mode
+        self._sample_size = sample_size
+        self._jitter = jitter
+
+    def __repr__(self) -> str:
+        """"""
+        return f"BatchControlVariateExpectedImprovement({self._sample_size!r}, jitter={self._jitter!r})"
+
+    def prepare_acquisition_function(
+        self,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        :return: The batch *expected improvement* acquisition function.
+        :raise ValueError (or InvalidArgumentError): If ``dataset`` is not populated, or ``model``
+            does not have an event shape of [1].
+        """
+        tf.debugging.Assert(dataset is not None, [tf.constant([])])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+
+        mean, _ = model.predict(dataset.query_points)
+
+        tf.debugging.assert_shapes(
+            [(mean, ["_", 1])], message="Expected model with event shape [1]."
+        )
+
+        eta = tf.reduce_min(mean, axis=0)
+        return batch_control_variate_expected_improvement(self._sample_size, model, eta, self._jitter, self._coeff_mode)
+
+    def update_acquisition_function(
+        self,
+        function: AcquisitionFunction,
+        model: HasReparamSampler,
+        dataset: Optional[Dataset] = None,
+    ) -> AcquisitionFunction:
+        """
+        :param function: The acquisition function to update.
+        :param model: The model. Must have event shape [1].
+        :param dataset: The data from the observer. Must be populated.
+        """
+        tf.debugging.Assert(dataset is not None, [tf.constant([])])
+        dataset = cast(Dataset, dataset)
+        tf.debugging.assert_positive(len(dataset), message="Dataset must be populated.")
+        tf.debugging.Assert(
+            isinstance(function, batch_control_variate_expected_improvement), [tf.constant([])]
+        )
+        mean, _ = model.predict(dataset.query_points)
+        eta = tf.reduce_min(mean, axis=0)
+        function.update(eta)  # type: ignore
+        return function
+
+
+class batch_control_variate_expected_improvement(AcquisitionFunctionClass):
+    def __init__(self, sample_size: int, model: HasReparamSampler, eta: TensorType, jitter: float, coeff_mode: str):
+        """
+        :param sample_size: The number of Monte-Carlo samples.
+        :param model: The model of the objective function.
+        :param eta: The "best" observation.
+        :param jitter: The size of the jitter to use when stabilising the Cholesky decomposition of
+            the covariance matrix.
+        :param coeff_mode: Speficies which coeffient to use in front of the control variate
+            variable, can be either "mean" or "cv".
+        :return: The expected improvement function. This function will raise
+            :exc:`ValueError` or :exc:`~tf.errors.InvalidArgumentError` if used with a batch size
+            greater than one.
+        """
+
+        # Check one of two allowed coefficient modes is used
+        assert coeff_mode == "mean" or coeff_mode == "cv"
+
+        self._sample_size = sample_size
+
+        if not isinstance(model, HasReparamSampler):
+            raise ValueError(
+                f"The batch control variate expected improvement acquisition function only supports "
+                f"models that implement a reparam_sampler method; received {model.__repr__()}"
+            )
+
+        sampler = model.reparam_sampler(self._sample_size)
+
+        self._model = model
+        self._sampler = sampler
+        self._eta = tf.Variable(eta)
+        self._jitter = jitter
+        self._coeff_mode = coeff_mode
+
+    def update(self, eta: TensorType) -> None:
+        """Update the acquisition function with a new eta value and reset the reparam sampler."""
+        self._eta.assign(eta)
+        self._sampler.reset_sampler()
+
+    @tf.function
+    def __call__(self, x: TensorType) -> TensorType:
+
+        # Compute analytic pointwise expected improvement
+        mean, variance = self._model.predict(x)
+        mean = mean[:, :, 0]
+        variance = variance[:, :, 0]
+
+        normal = tfp.distributions.Normal(mean, tf.sqrt(variance))
+        pointwise_ei = (self._eta - mean) * normal.cdf(self._eta) + variance * normal.prob(self._eta)
+        mean_pointwise_ei = tf.reduce_mean(pointwise_ei, axis=-1)
+
+        # Draw samples
+        samples = tf.squeeze(self._sampler.sample(x, jitter=self._jitter), axis=-1)  # [..., S, B]
+
+        # Compute sum of pointwise improvements
+        pointwise_improvements = tf.maximum(self._eta - samples, 0.0)  # [..., S, B]
+        mean_pointwise_improvements = tf.reduce_mean(pointwise_improvements, axis=-1)  # [..., S]
+        expected_mean_pointwise_improvements = tf.reduce_mean(
+            mean_pointwise_improvements,
+            axis=-1,
+        )  # [...]
+
+        # Compute joint improvements
+        min_sample_per_batch = tf.reduce_min(samples, axis=-1)  # [..., S]
+        batch_improvements = tf.maximum(self._eta - min_sample_per_batch, 0.0)  # [..., S]
+        expected_batch_improvements = tf.reduce_mean(
+            batch_improvements,
+            axis=-1,
+        )  # [...]
+
+        # Compute coefficient
+        if self._coeff_mode == "mean":
+            coeff = 1.
+
+        elif self._coeff_mode == "cv":
+            cov = tf.reduce_mean(mean_pointwise_improvements * batch_improvements, axis=-1)
+            cov = cov - expected_mean_pointwise_improvements * expected_batch_improvements
+
+            var = tf.reduce_mean(mean_pointwise_improvements ** 2, axis=-1)
+            var = var - expected_mean_pointwise_improvements ** 2
+
+            coeff = cov / (var + 1e-12)
+
+        else:
+            raise ValueError("Unrecognised coeff_mode passed to BatchControlVariateExpectedImprovement, should be 'mean' or 'cv', found '{self._coeff_mode}'.")
+
+        cvei = expected_batch_improvements + coeff * (mean_pointwise_ei - expected_mean_pointwise_improvements)
+        return cvei[..., None]
+
+
 class BatchExpectedImprovement(SingleModelAcquisitionBuilder[ProbabilisticModel]):
     """Accurate approximation of the batch expected improvement, using the
     method of Chvallier and Ginsbourger :cite:`chevalier2013fast`.

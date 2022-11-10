@@ -35,6 +35,7 @@ from .entropy import (
 )
 from .function import (
     AugmentedExpectedImprovement,
+    BatchControlVariateExpectedImprovement,
     BatchExpectedImprovement,
     BatchMonteCarloExpectedImprovement,
     ExpectedConstrainedImprovement,
