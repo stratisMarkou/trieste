@@ -1035,6 +1035,7 @@ class batch_monte_carlo_expected_improvement(AcquisitionFunctionClass):
         return tf.reduce_mean(batch_improvement, axis=-1, keepdims=True)  # [..., 1]
 
 
+<<<<<<< HEAD
 class BatchControlVariateExpectedImprovement(BatchMonteCarloExpectedImprovement):
 
     def __init__(self, sample_size: int, *, coeff_mode: str, jitter: float = DEFAULTS.JITTER):
